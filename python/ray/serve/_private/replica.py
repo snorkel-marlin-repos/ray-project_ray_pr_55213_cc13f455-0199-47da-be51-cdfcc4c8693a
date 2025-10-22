@@ -425,10 +425,8 @@ class ReplicaBase(ABC):
             ingress=ingress,
         )
 
-        self._internal_grpc_port: Optional[int] = None
+        self._port: Optional[int] = None
         self._docs_path: Optional[str] = None
-        self._http_port: Optional[int] = None
-        self._grpc_port: Optional[int] = None
 
     @property
     def max_ongoing_requests(self) -> int:
@@ -443,10 +441,8 @@ class ReplicaBase(ABC):
             self._version.deployment_config,
             self._version,
             self._initialization_latency,
-            self._internal_grpc_port,
+            self._port,
             self._docs_path,
-            self._http_port,
-            self._grpc_port,
             current_rank,
         )
 

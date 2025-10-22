@@ -16,16 +16,12 @@
 
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
+#include "ray/rpc/client_call.h"
 #include "src/ray/protobuf/autoscaler.pb.h"
 #include "src/ray/protobuf/common.pb.h"
 #include "src/ray/protobuf/node_manager.pb.h"
-
-// Maps from resource name to its allocation.
-using ResourceMappingType =
-    std::unordered_map<std::string, std::vector<std::pair<int64_t, double>>>;
 
 namespace grpc {
 class Channel;
@@ -41,11 +37,6 @@ class LeaseID;
 class NodeID;
 class BundleSpecification;
 
-namespace rpc {
-template <class Reply>
-using ClientCallback = std::function<void(const Status &status, Reply &&reply)>;
-}
-
 class RayletClientInterface {
  public:
   /// Request to a raylet to pin a plasma object. The callback will be sent via gRPC.
@@ -53,7 +44,7 @@ class RayletClientInterface {
       const rpc::Address &caller_address,
       const std::vector<ObjectID> &object_ids,
       const ObjectID &generator_id,
-      const rpc::ClientCallback<ray::rpc::PinObjectIDsReply> &callback) = 0;
+      const ray::rpc::ClientCallback<ray::rpc::PinObjectIDsReply> &callback) = 0;
 
   /// Requests a worker from the raylet. The callback will be sent via gRPC.
   /// \param lease_spec Lease that is requested by the owner.
@@ -65,7 +56,7 @@ class RayletClientInterface {
   virtual void RequestWorkerLease(
       const rpc::LeaseSpec &lease_spec,
       bool grant_or_reject,
-      const rpc::ClientCallback<ray::rpc::RequestWorkerLeaseReply> &callback,
+      const ray::rpc::ClientCallback<ray::rpc::RequestWorkerLeaseReply> &callback,
       const int64_t backlog_size = -1,
       const bool is_selected_based_on_locality = false) = 0;
 
