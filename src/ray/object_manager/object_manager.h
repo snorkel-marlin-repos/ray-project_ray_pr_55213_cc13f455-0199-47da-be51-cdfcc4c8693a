@@ -30,7 +30,7 @@
 #include "ray/object_manager/object_directory.h"
 #include "ray/object_manager/pull_manager.h"
 #include "ray/object_manager/push_manager.h"
-#include "ray/rpc/object_manager/object_manager_client_interface.h"
+#include "ray/rpc/object_manager/object_manager_client.h"
 #include "ray/rpc/object_manager/object_manager_server.h"
 #include "ray/stats/metric.h"
 #include "src/ray/protobuf/common.pb.h"
@@ -78,7 +78,6 @@ struct LocalObjectInfo {
   /// Information from the object store about the object.
   ObjectInfo object_info;
 };
-
 class ObjectStoreRunner {
  public:
   ObjectStoreRunner(const ObjectManagerConfig &config,
@@ -109,12 +108,10 @@ class ObjectManagerInterface {
   virtual bool PullManagerHasPullsQueued() const = 0;
   virtual int64_t GetMemoryCapacity() const = 0;
   virtual std::string DebugString() const = 0;
-  virtual void FillObjectStoreStats(rpc::GetNodeStatsReply *repOly) const = 0;
+  virtual void FillObjectStoreStats(rpc::GetNodeStatsReply *reply) const = 0;
   virtual double GetUsedMemoryPercentage() const = 0;
   virtual void Stop() = 0;
   virtual void RecordMetrics() = 0;
-  virtual void HandleObjectAdded(const ObjectInfo &object_info) = 0;
-  virtual void HandleObjectDeleted(const ObjectID &object_id) = 0;
 
   virtual ~ObjectManagerInterface() = default;
 };
@@ -167,6 +164,7 @@ class ObjectManager : public ObjectManagerInterface,
     return pull_manager_->NumInactivePulls(task_key);
   }
 
+ public:
   /// Takes user-defined IObjectDirectory implementation.
   /// When this constructor is used, the ObjectManager assumes ownership of
   /// the given ObjectDirectory instance.
@@ -182,15 +180,12 @@ class ObjectManager : public ObjectManagerInterface,
       IObjectDirectory *object_directory,
       RestoreSpilledObjectCallback restore_spilled_object,
       std::function<std::string(const ObjectID &)> get_spilled_object_url,
+      SpillObjectsCallback spill_objects_callback,
+      std::function<void()> object_store_full_callback,
+      AddObjectCallback add_object_callback,
+      DeleteObjectCallback delete_object_callback,
       std::function<std::unique_ptr<RayObject>(const ObjectID &object_id)> pin_object,
-      std::function<void(const ObjectID &, rpc::ErrorType)> fail_pull_request,
-      const std::shared_ptr<plasma::PlasmaClientInterface> &buffer_pool_store_client,
-      std::unique_ptr<ObjectStoreRunner> object_store_internal,
-      std::function<std::shared_ptr<rpc::ObjectManagerClientInterface>(
-          const std::string &address,
-          const int port,
-          rpc::ClientCallManager &client_call_manager)> object_manager_client_factory,
-      instrumented_io_context &rpc_service);
+      std::function<void(const ObjectID &, rpc::ErrorType)> fail_pull_request);
 
   ~ObjectManager() override;
 
@@ -273,14 +268,13 @@ class ObjectManager : public ObjectManagerInterface,
 
  private:
   friend class TestObjectManager;
-  friend uint32_t NumRemoteFreeObjectsRequests(const ObjectManager &object_manager);
 
   /// Spread the Free request to all objects managers.
   ///
   /// \param object_ids the The list of ObjectIDs to be deleted.
   void SpreadFreeObjectsRequest(
       const std::vector<ObjectID> &object_ids,
-      const std::vector<std::shared_ptr<rpc::ObjectManagerClientInterface>> &rpc_clients);
+      const std::vector<std::shared_ptr<rpc::ObjectManagerClient>> &rpc_clients);
 
   /// Pushing a known local object to a remote object manager.
   ///
@@ -326,7 +320,7 @@ class ObjectManager : public ObjectManagerInterface,
                        const ObjectID &object_id,
                        const NodeID &node_id,
                        uint64_t chunk_index,
-                       std::shared_ptr<rpc::ObjectManagerClientInterface> rpc_client,
+                       std::shared_ptr<rpc::ObjectManagerClient> rpc_client,
                        std::function<void(const Status &)> on_complete,
                        std::shared_ptr<ChunkObjectReader> chunk_reader,
                        bool from_disk);
@@ -339,12 +333,12 @@ class ObjectManager : public ObjectManagerInterface,
   /// Handle an object being added to this node. This adds the object to the
   /// directory, pushes the object to other nodes if necessary, and cancels any
   /// outstanding Pull requests for the object.
-  void HandleObjectAdded(const ObjectInfo &object_info) override;
+  void HandleObjectAdded(const ObjectInfo &object_info);
 
   /// Handle an object being deleted from this node. This registers object remove
   /// with directory. This also asks the pull manager to fetch this object again
   /// as soon as possible.
-  void HandleObjectDeleted(const ObjectID &object_id) override;
+  void HandleObjectDeleted(const ObjectID &object_id);
 
   /// This is used to notify the main thread that the sending of a chunk has
   /// completed.
@@ -404,7 +398,7 @@ class ObjectManager : public ObjectManagerInterface,
   /// Get the rpc client according to the node ID
   ///
   /// \param node_id Remote node id, will send rpc request to it
-  std::shared_ptr<rpc::ObjectManagerClientInterface> GetRpcClient(const NodeID &node_id);
+  std::shared_ptr<rpc::ObjectManagerClient> GetRpcClient(const NodeID &node_id);
 
   /// Weak reference to main service. We ensure this object is destroyed before
   /// main_service_ is stopped.
@@ -424,13 +418,20 @@ class ObjectManager : public ObjectManagerInterface,
 
   /// Used by the buffer pool to read and write objects in the local store
   /// during object transfers.
-  std::shared_ptr<plasma::PlasmaClientInterface> buffer_pool_store_client_;
+  std::shared_ptr<plasma::PlasmaClient> buffer_pool_store_client_;
 
   /// Manages accesses to local objects for object transfers.
   ObjectBufferPool buffer_pool_;
 
   /// Multi-thread asio service, deal with all outgoing and incoming RPC request.
-  instrumented_io_context &rpc_service_;
+  instrumented_io_context rpc_service_;
+
+  /// Keep rpc service running when no task in rpc service.
+  boost::asio::executor_work_guard<boost::asio::io_context::executor_type> rpc_work_;
+
+  /// The thread pool used for running `rpc_service`.
+  /// Data copy operations during request are done in this thread pool.
+  std::vector<std::thread> rpc_threads_;
 
   /// Mapping from locally available objects to information about those objects
   /// including when the object was last pushed to other object managers.
@@ -455,7 +456,7 @@ class ObjectManager : public ObjectManagerInterface,
   rpc::ClientCallManager client_call_manager_;
 
   /// Client id - object manager gRPC client.
-  absl::flat_hash_map<NodeID, std::shared_ptr<rpc::ObjectManagerClientInterface>>
+  absl::flat_hash_map<NodeID, std::shared_ptr<rpc::ObjectManagerClient>>
       remote_object_manager_clients_;
 
   /// Callback to trigger direct restoration of an object.
@@ -473,13 +474,6 @@ class ObjectManager : public ObjectManagerInterface,
 
   /// Object pull manager.
   std::unique_ptr<PullManager> pull_manager_;
-
-  /// Factory function to create object manager client.
-  std::function<std::shared_ptr<rpc::ObjectManagerClientInterface>(
-      const std::string &address,
-      const int port,
-      rpc::ClientCallManager &client_call_manager)>
-      object_manager_client_factory_;
 
   /// Running sum of the amount of memory used in the object store.
   int64_t used_memory_ = 0;
